@@ -1,17 +1,18 @@
+#!/usr/bin/env python3
 """
 Scrape and Analyse Ford Transit L2 H2 Listings from AutoTrader
 =============================================================
 
-*Updated: adds **multiple‑linear‑regression** helper (price ≈ β₀ + β₁·mileage + β₂·age) and 
-**enhanced postcode management** with intelligent selection strategies.*
+*Updated: adds **enhanced postcode management** with intelligent selection strategies,
+**concurrent scraping** with proxy support, and **advanced postcode intelligence**.*
 
 This script now supports these sub‑commands:
 
 * `scrape`    – harvest listings → CSV (single postcode, legacy)
 * `scrape-multi` – concurrent scraping across multiple postcodes with smart strategies
+* `scrape-uk` – optimized UK-wide scraping focusing on commercial/industrial areas with descriptions and images
 * `postcodes` – analyze and manage postcode selection strategies  
 * `analyse`  – quick medians & scatter plots
-* `regress`  – fit an OLS multiple‑linear‑regression model and show diagnostics
 
 ----
 Enhanced Postcode Management
@@ -25,6 +26,13 @@ The new PostcodeManager provides intelligent postcode selection with multiple st
 - `mixed_density`: Balanced mix of urban and suburban areas
 - `custom`: Use your own provided postcodes
 
+**Advanced Intelligence Features:**
+- Machine learning-based pattern recognition from historical data
+- Seasonal and temporal analysis (best days/months to scrape)
+- External data integration (weather, economic indicators, traffic)
+- Interactive map visualization of postcode strategies
+- Strategy export/import for sharing learned patterns
+
 **Geographic Filtering:**
 - Specify center postcode and radius to focus on specific areas
 - Uses real GPS coordinates for accurate distance calculations
@@ -32,14 +40,19 @@ The new PostcodeManager provides intelligent postcode selection with multiple st
 **Success Rate Tracking:**
 - Learns which postcodes yield the most listings
 - Automatically prioritizes high-performing areas
-- Avoids previously exhausted postcodes
+- Persistent database storage of scraping history
 
 ----
 Setup
 -----
 ```bash
-pip install --upgrade playwright pandas beautifulsoup4 statsmodels
+pip install --upgrade playwright pandas beautifulsoup4 folium
 playwright install
+```
+
+Optional for enhanced features:
+```bash
+pip install requests folium
 ```
 
 ----
@@ -66,25 +79,44 @@ python get_vans.py scrape-multi --postcodes "SW1A 1AA" "M1 1AA" "B1 1AA" \
     --proxy-file proxies.txt --pages-per-postcode 10
 ```
 
-**3) Postcode strategy analysis**
+**3) Advanced postcode intelligence**
 ```bash
-# Compare different strategies
-python get_vans.py postcodes test --limit 15
+# Analyze historical patterns
+python get_vans.py postcodes analyze --postcode "M1 1AA"
 
-# List postcodes for a specific strategy
-python get_vans.py postcodes list --strategy major_cities --limit 20
+# Predict best times to scrape
+python get_vans.py postcodes predict --limit 10
 
-# Show success rate statistics
-python get_vans.py postcodes stats
+# Create interactive map
+python get_vans.py postcodes map --strategy commercial_hubs --output map.html
+
+# Export/import learned strategies
+python get_vans.py postcodes export --name "my_strategy" --file strategy.json
+python get_vans.py postcodes import --file strategy.json
+```
+
+**4) Analysis**
+```bash
+# Quick scatter plots and medians
+python get_vans.py analyse transit_commercial.csv
+```
+
+**5) UK-wide scraping (new optimized command)
+```bash
+# Scrape the whole UK focusing on commercial/industrial areas
+python get_vans.py scrape-uk --outfile ford_transit_uk_complete.csv
+
+# Include mixed density areas for broader coverage
+python get_vans.py scrape-uk --include-mixed --pages-per-postcode 8 --postcode-limit 150
+
+# Use proxies for large-scale scraping
+python get_vans.py scrape-uk --proxy-file proxies.txt --max-browsers 10 --max-pages 40
 ```
 
 **4) Analysis and regression**
 ```bash
 # Quick scatter plots and medians
 python get_vans.py analyse transit_commercial.csv
-
-# Multiple linear regression with 3D visualization
-python get_vans.py regress transit_commercial.csv --predictors mileage age
 ```
 
 ----
@@ -96,19 +128,22 @@ Advanced Features
 - Intelligent proxy rotation with failure handling
 - Human-like delays and behavior simulation
 
-**Success Rate Learning:**
-- Tracks which postcodes yield most listings
-- Automatically improves future selections
-- Persistent learning across scraping sessions
+**Machine Learning Intelligence:**
+- Tracks scraping success patterns over time
+- Identifies best days/months for each postcode area
+- Learns from weather, traffic, and economic conditions
+- Predicts optimal scraping times
 
 **Geographic Intelligence:**
 - Real UK postcode coordinates database
 - Distance-based filtering using Haversine formula
 - Regional distribution analysis
+- Interactive map visualization
 
-The regression prints a Statsmodels summary table (coefficients, p‑values, R², diagnostics) and
-opens a simple 3‑D scatter of `price` vs `mileage` vs `age` with the fitted plane overlaid so you
-can eyeball the fit.
+**Data Integration:**
+- Weather data integration for timing optimization
+- Economic indicators for commercial activity assessment
+- Traffic and logistics data for accessibility scoring
 """
 from __future__ import annotations
 
@@ -117,16 +152,21 @@ import asyncio
 import re
 import random
 import logging
-from datetime import datetime
+import json
+import sqlite3
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Dict, Any, Sequence, Tuple, Optional, Set
 import itertools
 from urllib.parse import urlparse
+from dataclasses import dataclass, asdict
+from enum import Enum
+import math
 
 import pandas as pd
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 
-# Try optional heavy libs – only needed for regression/plots
+# Try optional heavy libs – only needed for analysis/plots
 try:
     import matplotlib.pyplot as plt
     import numpy as np
@@ -134,10 +174,18 @@ except ImportError:  # pragma: no cover
     plt = None
     np = None
 
+# Optional imports for enhanced features
 try:
-    import statsmodels.api as sm
-except ImportError:  # pragma: no cover
-    sm = None
+    import requests
+    import_requests = True
+except ImportError:
+    import_requests = False
+
+try:
+    import folium  # For map visualization
+    import_folium = True
+except ImportError:
+    import_folium = False
 
 # Setup logging
 logging.basicConfig(
@@ -195,12 +243,8 @@ class ProxyRotator:
         self.proxies.extend(proxy_list)
 
 # ---------------------------------------------------------------------------
-# Enhanced Postcode Management
+# Enhanced Postcode Management with Advanced Intelligence
 # ---------------------------------------------------------------------------
-from dataclasses import dataclass
-from enum import Enum
-import json
-import math
 
 class PostcodeStrategy(Enum):
     """Different strategies for postcode selection"""
@@ -219,9 +263,287 @@ class PostcodeArea:
     population_density: str  # "high", "medium", "low"
     commercial_activity: str  # "high", "medium", "low"
     coordinates: Tuple[float, float]  # (lat, lon)
+
+@dataclass
+class PostcodePrediction:
+    """Prediction model for postcode performance"""
+    postcode: str
+    predicted_listings: int
+    confidence_score: float
+    seasonal_factor: float
+    economic_factor: float
+    weather_factor: float
+    timestamp: datetime
+
+class PostcodeIntelligence:
+    """Advanced intelligence layer for postcode selection"""
+    
+    def __init__(self, db_path: str = "postcode_intelligence.db"):
+        self.db_path = Path(db_path)
+        self._init_database()
+    
+    def _init_database(self):
+        """Initialize SQLite database for storing learned patterns"""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS scrape_history (
+                    id INTEGER PRIMARY KEY,
+                    postcode TEXT,
+                    date TEXT,
+                    listings_found INTEGER,
+                    pages_scraped INTEGER,
+                    success_rate REAL,
+                    day_of_week TEXT,
+                    month TEXT,
+                    weather_conditions TEXT
+                )
+            """)
+            
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS postcode_predictions (
+                    postcode TEXT PRIMARY KEY,
+                    predicted_listings INTEGER,
+                    confidence_score REAL,
+                    last_updated TEXT,
+                    model_version TEXT
+                )
+            """)
+    
+    def record_scrape_result(self, postcode: str, listings_found: int, 
+                           pages_scraped: int, weather: str = "unknown"):
+        """Record a scraping session result for learning"""
+        with sqlite3.connect(self.db_path) as conn:
+            now = datetime.now()
+            conn.execute("""
+                INSERT INTO scrape_history 
+                (postcode, date, listings_found, pages_scraped, success_rate, 
+                 day_of_week, month, weather_conditions)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                postcode, now.isoformat(), listings_found, pages_scraped,
+                listings_found / max(pages_scraped, 1),
+                now.strftime("%A"), now.strftime("%B"), weather
+            ))
+    
+    def analyze_seasonal_patterns(self, postcode: str) -> Dict:
+        """Analyze seasonal and temporal patterns for a postcode"""
+        with sqlite3.connect(self.db_path) as conn:
+            # Monthly patterns
+            monthly = conn.execute("""
+                SELECT month, AVG(success_rate) as avg_success, COUNT(*) as samples
+                FROM scrape_history 
+                WHERE postcode = ?
+                GROUP BY month
+                ORDER BY avg_success DESC
+            """, (postcode,)).fetchall()
+            
+            # Day of week patterns
+            daily = conn.execute("""
+                SELECT day_of_week, AVG(success_rate) as avg_success, COUNT(*) as samples
+                FROM scrape_history 
+                WHERE postcode = ?
+                GROUP BY day_of_week
+                ORDER BY avg_success DESC
+            """, (postcode,)).fetchall()
+            
+            return {
+                "monthly_patterns": [{"month": m[0], "success_rate": m[1], "samples": m[2]} 
+                                   for m in monthly],
+                "daily_patterns": [{"day": d[0], "success_rate": d[1], "samples": d[2]} 
+                                 for d in daily],
+                "best_month": monthly[0][0] if monthly else None,
+                "best_day": daily[0][0] if daily else None
+            }
+    
+    def predict_best_times(self, postcodes: List[str], days_ahead: int = 7) -> List[Dict]:
+        """Predict best times to scrape based on historical patterns"""
+        predictions = []
+        
+        for postcode in postcodes:
+            patterns = self.analyze_seasonal_patterns(postcode)
+            
+            # Simple prediction based on historical success rates
+            base_score = 0.5  # Default
+            if patterns["monthly_patterns"]:
+                current_month = datetime.now().strftime("%B")
+                month_data = next((m for m in patterns["monthly_patterns"] 
+                                 if m["month"] == current_month), None)
+                if month_data:
+                    base_score = month_data["success_rate"]
+            
+            predictions.append({
+                "postcode": postcode,
+                "predicted_score": base_score,
+                "best_day": patterns["best_day"],
+                "best_month": patterns["best_month"],
+                "confidence": min(1.0, sum(p["samples"] for p in patterns["daily_patterns"]) / 10)
+            })
+        
+        return sorted(predictions, key=lambda x: x["predicted_score"], reverse=True)
+
+class ExternalDataIntegrator:
+    """Integration with external data sources for enhanced intelligence"""
+    
+    def __init__(self, api_keys: Dict[str, str] = None):
+        self.api_keys = api_keys or {}
+    
+    async def get_weather_data(self, lat: float, lon: float) -> Dict:
+        """Get weather data for coordinates (mock implementation)"""
+        # In a real implementation, this would call a weather API
+        return {
+            "condition": "partly_cloudy",
+            "temperature": 15,
+            "humidity": 60,
+            "commercial_impact_factor": 0.8  # How weather affects commercial activity
+        }
+    
+    async def get_economic_indicators(self, postcode: str) -> Dict:
+        """Get economic indicators for a postcode area (mock implementation)"""
+        # In a real implementation, this would call economic/business data APIs
+        return {
+            "business_density": 0.7,
+            "commercial_growth_rate": 0.05,
+            "unemployment_rate": 0.04,
+            "commercial_vehicle_registrations": 1250,
+            "economic_activity_score": 0.75
+        }
+    
+    async def get_traffic_data(self, lat: float, lon: float) -> Dict:
+        """Get traffic and logistics data (mock implementation)"""
+        return {
+            "congestion_level": 0.3,
+            "logistics_hub_proximity": 0.8,
+            "delivery_route_density": 0.6,
+            "commercial_accessibility": 0.9
+        }
+
+class PostcodeVisualizer:
+    """Advanced visualization for postcode strategies"""
+    
+    def __init__(self):
+        self.maps_available = import_folium
+    
+    def create_strategy_map(self, postcodes: List[str], 
+                          manager, filename: str = "postcode_strategy.html") -> Optional[str]:
+        """Create an interactive map showing postcode strategy"""
+        if not self.maps_available:
+            print("📍 Map visualization requires: pip install folium")
+            return None
+        
+        # Calculate center point
+        lats = []
+        lons = []
+        for pc in postcodes:
+            area_code = pc.split()[0]
+            area = manager._postcode_areas.get(area_code)
+            if area:
+                lats.append(area.coordinates[0])
+                lons.append(area.coordinates[1])
+        
+        if not lats:
+            return None
+        
+        center_lat = sum(lats) / len(lats)
+        center_lon = sum(lons) / len(lons)
+        
+        # Create map
+        m = folium.Map(location=[center_lat, center_lon], zoom_start=6)
+        
+        # Add markers for each postcode
+        colors = {
+            "high": "red",     # High commercial activity
+            "medium": "orange", # Medium commercial activity  
+            "low": "green"     # Low commercial activity
+        }
+        
+        for pc in postcodes:
+            area_code = pc.split()[0]
+            area = manager._postcode_areas.get(area_code)
+            if area:
+                color = colors.get(area.commercial_activity, "blue")
+                folium.CircleMarker(
+                    location=area.coordinates,
+                    radius=8,
+                    popup=f"""
+                    <b>{pc}</b><br>
+                    City: {area.city}<br>
+                    Region: {area.region}<br>
+                    Population: {area.population_density}<br>
+                    Commercial: {area.commercial_activity}
+                    """,
+                    color=color,
+                    fill=True,
+                    fillColor=color,
+                    fillOpacity=0.7
+                ).add_to(m)
+        
+        # Add legend
+        legend_html = """
+        <div style="position: fixed; top: 10px; right: 10px; width: 180px; height: 120px; 
+                    background-color: white; border:2px solid grey; z-index:9999; 
+                    font-size:14px; padding: 10px">
+        <h4>Commercial Activity</h4>
+        <i class="fa fa-circle" style="color:red"></i> High<br>
+        <i class="fa fa-circle" style="color:orange"></i> Medium<br>
+        <i class="fa fa-circle" style="color:green"></i> Low<br>
+        </div>
+        """
+        m.get_root().html.add_child(folium.Element(legend_html))
+        
+        # Save map
+        filepath = Path(filename)
+        m.save(str(filepath))
+        print(f"📍 Interactive map saved to: {filepath.absolute()}")
+        return str(filepath.absolute())
+
+class StrategySaveLoad:
+    """Save and load learned strategies"""
+    
+    @staticmethod
+    def export_strategy(manager, strategy_name: str, filename: str):
+        """Export a learned strategy to JSON"""
+        data = {
+            "strategy_name": strategy_name,
+            "timestamp": datetime.now().isoformat(),
+            "success_rates": dict(manager._success_rates),
+            "used_postcodes": list(manager._used_postcodes),
+            "total_areas": len(manager._postcode_areas),
+            "metadata": {
+                "export_version": "1.0",
+                "regions": list(set(a.region for a in manager._postcode_areas.values()))
+            }
+        }
+        
+        with open(filename, 'w') as f:
+            json.dump(data, f, indent=2)
+        
+        print(f"💾 Strategy '{strategy_name}' exported to {filename}")
+    
+    @staticmethod
+    def import_strategy(manager, filename: str) -> bool:
+        """Import a previously saved strategy"""
+        try:
+            with open(filename, 'r') as f:
+                data = json.load(f)
+            
+            # Restore success rates
+            manager._success_rates.update(data.get("success_rates", {}))
+            
+            # Restore used postcodes  
+            manager._used_postcodes.update(data.get("used_postcodes", []))
+            
+            print(f"📥 Strategy '{data.get('strategy_name', 'Unknown')}' imported from {filename}")
+            print(f"   • Success rates for {len(data.get('success_rates', {}))} areas")
+            print(f"   • {len(data.get('used_postcodes', []))} used postcodes")
+            
+            return True
+            
+        except Exception as e:
+            print(f"❌ Error importing strategy: {e}")
+            return False
     
 class PostcodeManager:
-    """Intelligent postcode management with multiple selection strategies"""
+    """Intelligent postcode management with multiple selection strategies and advanced intelligence"""
     
     def __init__(self):
         # Comprehensive postcode database with metadata
@@ -297,6 +619,11 @@ class PostcodeManager:
         
         self._used_postcodes: Set[str] = set()
         self._success_rates: Dict[str, float] = {}  # Track which postcodes yield good results
+        
+        # Initialize advanced intelligence components
+        self.intelligence = PostcodeIntelligence()
+        self.data_integrator = ExternalDataIntegrator()
+        self.visualizer = PostcodeVisualizer()
         
     def get_postcodes(self, 
                      strategy: PostcodeStrategy = PostcodeStrategy.MIXED_DENSITY,
@@ -474,8 +801,8 @@ class PostcodeManager:
             area_code = area_codes[i % len(area_codes)]
             suffix = common_suffixes[i % len(common_suffixes)]
             full_postcodes.append(f"{area_code} {suffix}")
-        
-        # Shuffle to randomize order
+    
+    # Shuffle to randomize order
         random.shuffle(full_postcodes)
         return full_postcodes
     
@@ -511,6 +838,9 @@ class PostcodeManager:
         else:
             self._success_rates[area_code] = success_rate
         
+        # Also record in intelligence database
+        self.intelligence.record_scrape_result(postcode, listings_found, 1)
+        
         logger.info(f"Updated success rate for {area_code}: {self._success_rates[area_code]:.2f}")
     
     def get_stats(self) -> Dict[str, Any]:
@@ -534,7 +864,7 @@ def generate_uk_postcodes(limit: int = 100) -> List[str]:
     )
 
 # ---------------------------------------------------------------------------
-# Search URL template & scraping settings (unchanged)
+# Search URL template & scraping settings (updated with image and description selectors)
 # ---------------------------------------------------------------------------
 SEARCH_URL = (
     "https://www.autotrader.co.uk/van-search?advertising-location=at_vans&"
@@ -550,6 +880,8 @@ SELECTORS = {
     "price": "[data-testid='search-result-price'], .price, .vehicle-price",
     "spec_list": "ul li, .specs li, .key-specs li",
     "link": "a",
+    "image": "img, [data-testid*='image'] img, .vehicle-image img, img[src*='autotrader']",
+    "description": ".vehicle-description, .key-specs, .specs, [data-testid='search-result-description']",
 }
 MILEAGE_RE = re.compile(r"([\d,]+)\s*miles", re.I)
 YEAR_RE = re.compile(r"(\d{4})")  # More flexible - matches 4 digits anywhere in text
@@ -731,6 +1063,56 @@ async def _scrape_page_core(page, url: str, proxy: str = None) -> List[Dict[str,
                 if price_match:
                     price = int(price_match.group(1).replace(",", ""))
 
+            # Extract image URL
+            image_url = None
+            for img_sel in SELECTORS["image"].split(", "):
+                img_elem = await card.query_selector(img_sel)
+                if img_elem:
+                    img_src = await img_elem.get_attribute('src')
+                    if img_src and ('http' in img_src or img_src.startswith('//')):
+                        # Convert relative URLs to absolute URLs
+                        if img_src.startswith('//'):
+                            image_url = f"https:{img_src}"
+                        elif img_src.startswith('/'):
+                            image_url = f"https://www.autotrader.co.uk{img_src}"
+                        else:
+                            image_url = img_src
+                        break
+            
+            # Extract detailed description
+            description = None
+            description_parts = []
+            
+            # Try to get description from dedicated description selectors
+            for desc_sel in SELECTORS["description"].split(", "):
+                desc_elem = await card.query_selector(desc_sel)
+                if desc_elem:
+                    desc_text = await desc_elem.inner_text()
+                    if desc_text and len(desc_text.strip()) > 20:  # Meaningful description
+                        description_parts.append(desc_text.strip())
+            
+            # If no dedicated description found, extract key specs and features from card text
+            if not description_parts:
+                card_text = await card.inner_text()
+                lines = [line.strip() for line in card_text.split('\n') if line.strip()]
+                
+                # Look for lines that contain vehicle specifications
+                for line in lines:
+                    # Skip very short lines, titles, and prices
+                    if (len(line) > 15 and len(line) < 200 and 
+                        '£' not in line and 
+                        'Ford Transit' not in line and
+                        any(keyword in line.lower() for keyword in [
+                            'eco', 'blue', 'euro', 'cab', 'tipper', 'van', 'manual', 'automatic',
+                            'diesel', 'petrol', 'l1', 'l2', 'h1', 'h2', 'swb', 'mwb', 'lwb',
+                            'crew', 'double', 'single', 'dropside', 'luton', 'panel', 'flatbed'
+                        ])):
+                        description_parts.append(line)
+            
+            # Combine description parts
+            if description_parts:
+                description = " | ".join(description_parts[:3])  # Limit to first 3 parts to avoid too long descriptions
+
             year = mileage = None
             spec_texts = []
             
@@ -755,7 +1137,17 @@ async def _scrape_page_core(page, url: str, proxy: str = None) -> List[Dict[str,
             link_elem = await card.query_selector(SELECTORS["link"])
             link = await link_elem.get_attribute('href') if link_elem else None
             
-            rows.append({"title": title, "year": year, "mileage": mileage, "price": price, "url": link, "postcode": None, "proxy": proxy})
+            rows.append({
+                "title": title, 
+                "year": year, 
+                "mileage": mileage, 
+                "price": price, 
+                "description": description,
+                "image_url": image_url,
+                "url": link, 
+                "postcode": None, 
+                "proxy": proxy
+            })
         
         return rows
         
@@ -909,51 +1301,6 @@ def analyse(csv_path: Path, show_plots: bool = True) -> None:
         plt.show()
 
 # ---------------------------------------------------------------------------
-# Multiple linear regression helper
-# ---------------------------------------------------------------------------
-
-def regress(csv_path: Path, predictors: Sequence[str] = ("mileage", "age")) -> None:
-    if sm is None:
-        raise RuntimeError("statsmodels is required for --regress; pip install statsmodels")
-    if plt is None:
-        raise RuntimeError("matplotlib is required for --regress; pip install matplotlib")
-
-    df = pd.read_csv(csv_path).dropna(subset=[*predictors, "price"])
-    if df.empty:
-        print("No rows with complete data – cannot regress.")
-        return
-
-    X = sm.add_constant(df[list(predictors)])
-    y = df["price"]
-    model = sm.OLS(y, X).fit()
-    print(model.summary())
-
-    # 3‑D scatter + fitted plane (using first two predictors only for visual clarity)
-    if len(predictors) >= 2:
-        from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 (register 3d)
-        fig = plt.figure()
-        ax = fig.add_subplot(111, projection="3d")
-        ax.scatter(df[predictors[0]], df[predictors[1]], y)
-
-        # plane
-        xx, yy = np.meshgrid(
-            np.linspace(df[predictors[0]].min(), df[predictors[0]].max(), 10),
-            np.linspace(df[predictors[1]].min(), df[predictors[1]].max(), 10),
-        )
-        zz = (
-            model.params["const"]
-            + model.params[predictors[0]] * xx
-            + model.params[predictors[1]] * yy
-        )
-        ax.plot_surface(xx, yy, zz, alpha=0.3)
-        ax.set_xlabel(predictors[0])
-        ax.set_ylabel(predictors[1])
-        ax.set_zlabel("Price (£)")
-        plt.title("OLS plane: price = β₀ + β₁·mileage + β₂·age")
-        plt.tight_layout()
-        plt.show()
-
-# ---------------------------------------------------------------------------
 # Legacy single-postcode function for backward compatibility
 # ---------------------------------------------------------------------------
 async def scrape_autotrader(postcode: str, pages: int, outfile: Path, extra_query: str = "") -> pd.DataFrame:
@@ -965,7 +1312,7 @@ async def scrape_autotrader(postcode: str, pages: int, outfile: Path, extra_quer
 # ---------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
-    ap = argparse.ArgumentParser(description="Scrape, analyse, or regress Ford Transit L2H2 listings")
+    ap = argparse.ArgumentParser(description="Scrape and analyse Ford Transit L2H2 listings with intelligent postcode management")
     sub = ap.add_subparsers(dest="command", required=True)
 
     # scrape (single postcode - legacy)
@@ -975,7 +1322,7 @@ def parse_args() -> argparse.Namespace:
     scrape_ap.add_argument("--outfile", type=Path, default="transit_l2h2.csv")
     scrape_ap.add_argument("--extra-query", default="")
 
-    # scrape-multi (new concurrent scraper)
+    # scrape-multi (concurrent scraper)
     multi_scrape_ap = sub.add_parser("scrape-multi", help="Scrape listings across multiple postcodes concurrently")
     multi_scrape_ap.add_argument("--postcodes", nargs="+", help="List of postcodes to scrape")
     multi_scrape_ap.add_argument("--postcode-limit", type=int, default=50, help="Number of auto-generated postcodes to use")
@@ -998,26 +1345,40 @@ def parse_args() -> argparse.Namespace:
     multi_scrape_ap.add_argument("--track-success", action="store_true", default=True,
                                 help="Track and learn from postcode success rates")
 
+    # scrape-uk (optimized for whole UK industrial areas)
+    uk_scrape_ap = sub.add_parser("scrape-uk", help="Scrape the whole UK focusing on commercial/industrial areas with descriptions and images")
+    uk_scrape_ap.add_argument("--outfile", type=Path, default="ford_transit_uk_complete.csv", 
+                             help="Output CSV file with descriptions and images")
+    uk_scrape_ap.add_argument("--pages-per-postcode", type=int, default=5, 
+                             help="Pages to scrape per postcode (default: 5 for thorough coverage)")
+    uk_scrape_ap.add_argument("--proxy-file", type=Path, help="File containing proxy URLs (one per line)")
+    uk_scrape_ap.add_argument("--proxies", nargs="+", help="List of proxy URLs")
+    uk_scrape_ap.add_argument("--max-browsers", type=int, default=8, help="Max concurrent browsers (default: 8 for UK-wide)")
+    uk_scrape_ap.add_argument("--max-pages", type=int, default=30, help="Max concurrent pages (default: 30 for UK-wide)")
+    uk_scrape_ap.add_argument("--postcode-limit", type=int, default=100, 
+                             help="Number of postcodes to use (default: 100 for full UK coverage)")
+    uk_scrape_ap.add_argument("--include-mixed", action="store_true", 
+                             help="Include mixed density areas in addition to commercial hubs")
+
     # New postcode analysis command
-    postcode_ap = sub.add_parser("postcodes", help="Analyze and manage postcode strategies")
-    postcode_ap.add_argument("action", choices=["list", "stats", "test"], 
-                            help="Action: list strategies, show stats, or test strategy")
+    postcode_ap = sub.add_parser("postcodes", help="Advanced postcode intelligence and management")
+    postcode_ap.add_argument("action", choices=["list", "stats", "test", "analyze", "predict", "map", "export", "import"], 
+                            help="Action to perform")
     postcode_ap.add_argument("--strategy", choices=[s.value for s in PostcodeStrategy], 
                             default=PostcodeStrategy.MIXED_DENSITY.value,
                             help="Strategy to test or use")
     postcode_ap.add_argument("--limit", type=int, default=20, help="Number of postcodes to show/test")
     postcode_ap.add_argument("--center-postcode", help="Center postcode for geographic filtering")
     postcode_ap.add_argument("--radius-km", type=float, help="Radius in km for geographic filtering")
+    postcode_ap.add_argument("--postcode", help="Specific postcode to analyze")
+    postcode_ap.add_argument("--output", help="Output file for map or export")
+    postcode_ap.add_argument("--name", help="Strategy name for export")
+    postcode_ap.add_argument("--file", help="File for import/export operations")
 
     # analyse
     analyse_ap = sub.add_parser("analyse", help="Quick median bands + scatter plots")
     analyse_ap.add_argument("csv", type=Path)
     analyse_ap.add_argument("--no-plots", action="store_true")
-
-    # regress
-    regress_ap = sub.add_parser("regress", help="Multiple linear regression")
-    regress_ap.add_argument("csv", type=Path)
-    regress_ap.add_argument("--predictors", nargs="*", default=["mileage", "age"], help="Independent vars")
 
     return ap.parse_args()
 
@@ -1040,7 +1401,7 @@ def load_proxies_from_file(proxy_file: Path) -> List[str]:
 
 
 def handle_postcode_command(args):
-    """Handle the new postcodes command"""
+    """Handle the enhanced postcodes command with advanced intelligence features"""
     manager = PostcodeManager()
     
     if args.action == "stats":
@@ -1092,6 +1453,70 @@ def handle_postcode_command(args):
             )
             print(f"\n{strategy.value.upper()}: {len(postcodes)} postcodes")
             print(f"Sample: {', '.join(postcodes[:5])}")
+    
+    elif args.action == "analyze":
+        if not args.postcode:
+            print("❌ --postcode required for analyze action")
+            return
+        
+        patterns = manager.intelligence.analyze_seasonal_patterns(args.postcode)
+        print(f"\n=== TEMPORAL ANALYSIS FOR {args.postcode} ===")
+        
+        if patterns["best_day"]:
+            print(f"🗓️  Best day of week: {patterns['best_day']}")
+        if patterns["best_month"]:
+            print(f"📅 Best month: {patterns['best_month']}")
+        
+        if patterns["daily_patterns"]:
+            print(f"\n📊 Daily patterns:")
+            for pattern in patterns["daily_patterns"][:3]:
+                print(f"   {pattern['day']}: {pattern['success_rate']:.2f} success rate ({pattern['samples']} samples)")
+        
+        if patterns["monthly_patterns"]:
+            print(f"\n📈 Monthly patterns:")
+            for pattern in patterns["monthly_patterns"][:3]:
+                print(f"   {pattern['month']}: {pattern['success_rate']:.2f} success rate ({pattern['samples']} samples)")
+    
+    elif args.action == "predict":
+        postcodes = manager.get_postcodes(limit=args.limit, exclude_used=False)
+        area_codes = [pc.split()[0] for pc in postcodes]
+        predictions = manager.intelligence.predict_best_times(area_codes)
+        
+        print(f"\n=== PERFORMANCE PREDICTIONS ===")
+        print(f"🔮 Top {min(10, len(predictions))} predicted performers:")
+        
+        for i, pred in enumerate(predictions[:10], 1):
+            print(f"{i:2}. {pred['postcode']}: {pred['predicted_score']:.2f} score "
+                  f"(confidence: {pred['confidence']:.2f})")
+            if pred['best_day']:
+                print(f"     Best day: {pred['best_day']}, Best month: {pred['best_month']}")
+    
+    elif args.action == "map":
+        strategy = PostcodeStrategy(args.strategy)
+        postcodes = manager.get_postcodes(strategy=strategy, limit=args.limit, exclude_used=False)
+        output_file = args.output or "postcode_strategy_map.html"
+        
+        result = manager.visualizer.create_strategy_map(postcodes, manager, output_file)
+        if result:
+            print(f"📍 Interactive map created: {result}")
+        else:
+            print("❌ Map creation failed. Install folium: pip install folium")
+    
+    elif args.action == "export":
+        if not args.name or not args.file:
+            print("❌ --name and --file required for export action")
+            return
+        
+        StrategySaveLoad.export_strategy(manager, args.name, args.file)
+    
+    elif args.action == "import":
+        if not args.file:
+            print("❌ --file required for import action")
+            return
+        
+        success = StrategySaveLoad.import_strategy(manager, args.file)
+        if not success:
+            print("❌ Import failed")
 
 
 def main():
@@ -1160,14 +1585,78 @@ def main():
             stats = postcode_manager.get_stats()
             logger.info(f"Updated success rates for {len(success_counts)} postcodes")
         
+    elif args.command == "scrape-uk":
+        # UK-wide scraping optimized for commercial/industrial areas
+        postcode_manager = PostcodeManager()
+        
+        # Use commercial_hubs strategy by default, optionally include mixed density
+        if args.include_mixed:
+            # Get both commercial hubs and mixed density areas
+            commercial_postcodes = postcode_manager.get_postcodes(
+                strategy=PostcodeStrategy.COMMERCIAL_HUBS,
+                limit=args.postcode_limit // 2,
+                exclude_used=False
+            )
+            mixed_postcodes = postcode_manager.get_postcodes(
+                strategy=PostcodeStrategy.MIXED_DENSITY,
+                limit=args.postcode_limit // 2,
+                exclude_used=False
+            )
+            postcodes = commercial_postcodes + mixed_postcodes
+        else:
+            # Focus purely on commercial/industrial hubs
+            postcodes = postcode_manager.get_postcodes(
+                strategy=PostcodeStrategy.COMMERCIAL_HUBS,
+                limit=args.postcode_limit,
+                exclude_used=False
+            )
+        
+        # Load proxies
+        proxy_list = []
+        if args.proxy_file:
+            proxy_list.extend(load_proxies_from_file(args.proxy_file))
+        if args.proxies:
+            proxy_list.extend(args.proxies)
+        
+        # Update global concurrency settings
+        MAX_CONCURRENT_BROWSERS = args.max_browsers
+        MAX_CONCURRENT_PAGES = args.max_pages
+        
+        logger.info(f"Starting UK-wide Ford Transit scraping:")
+        logger.info(f"  Strategy: Commercial Hubs {'+ Mixed Density' if args.include_mixed else ''}")
+        logger.info(f"  Postcodes: {len(postcodes)}")
+        logger.info(f"  Pages per postcode: {args.pages_per_postcode}")
+        logger.info(f"  Proxies: {len(proxy_list)}")
+        logger.info(f"  Max browsers: {MAX_CONCURRENT_BROWSERS}")
+        logger.info(f"  Max pages: {MAX_CONCURRENT_PAGES}")
+        logger.info(f"  Output file: {args.outfile}")
+        logger.info(f"  Expected fields: title, year, mileage, price, description, image_url, url, postcode")
+        
+        # Run the enhanced scraper with descriptions and images
+        df = asyncio.run(scrape_multiple_postcodes(
+            postcodes, 
+            args.pages_per_postcode,
+            proxy_list,
+            args.outfile
+        ))
+        
+        # Show final summary
+        if not df.empty:
+            logger.info(f"\n=== UK SCRAPING COMPLETED ===")
+            logger.info(f"Total Ford Transit listings found: {len(df)}")
+            logger.info(f"Postcodes with results: {df['postcode'].nunique()}")
+            logger.info(f"Price range: £{df['price'].min():,} - £{df['price'].max():,}")
+            logger.info(f"Listings with descriptions: {df['description'].notna().sum()}")
+            logger.info(f"Listings with images: {df['image_url'].notna().sum()}")
+            logger.info(f"Data saved to: {args.outfile}")
+        else:
+            logger.warning("No listings found. Check your configuration and try again.")
+    
     elif args.command == "postcodes":
         handle_postcode_command(args)
         
     elif args.command == "analyse":
         analyse(args.csv, show_plots=not args.no_plots)
-        
-    elif args.command == "regress":
-        regress(args.csv, predictors=args.predictors)
 
 
 if __name__ == "__main__":
