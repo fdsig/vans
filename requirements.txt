@@ -8,3 +8,5 @@ scipy>=1.11
 seaborn>=0.13
 plotly>=5.22
 scikit-learn
+psutil>=5.9
+jupyter

@@ -172,3 +172,8 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# File Audit System
+# Audit logs and state files (comment out if you want to track audit history in git)
+file_audit.log
+file_audit_state.json

@@ -278,7 +278,7 @@ class PostcodePrediction:
 class PostcodeIntelligence:
     """Advanced intelligence layer for postcode selection"""
     
-    def __init__(self, db_path: str = "postcode_intelligence.db"):
+    def __init__(self, db_path: str = "data/postcode_intelligence.db"):
         self.db_path = Path(db_path)
         self._init_database()
     
@@ -823,7 +823,7 @@ class PostcodeManager:
         
         return formatted
     
-    def record_success_rate(self, postcode: str, listings_found: int):
+    def record_success_rate(self, postcode: str, listings_found: int, source: str = "autotrader"):
         """Record the success rate for a postcode based on listings found"""
         # Normalize postcode area (remove suffix)
         area_code = postcode.split()[0] if ' ' in postcode else postcode[:2]
@@ -841,7 +841,7 @@ class PostcodeManager:
         # Also record in intelligence database
         self.intelligence.record_scrape_result(postcode, listings_found, 1)
         
-        logger.info(f"Updated success rate for {area_code}: {self._success_rates[area_code]:.2f}")
+        logger.info(f"Updated success rate for {area_code}: {self._success_rates[area_code]:.2f} (source: {source})")
     
     def get_stats(self) -> Dict[str, Any]:
         """Get statistics about postcode usage and success rates"""
@@ -1137,6 +1137,11 @@ async def _scrape_page_core(page, url: str, proxy: str = None) -> List[Dict[str,
             link_elem = await card.query_selector(SELECTORS["link"])
             link = await link_elem.get_attribute('href') if link_elem else None
             
+            # Detect VAT status from card text
+            from van_scraping_utils import detect_vat_status
+            card_text = await card.inner_text()
+            vat_included = detect_vat_status(card_text, "autotrader")
+            
             rows.append({
                 "title": title, 
                 "year": year, 
@@ -1144,8 +1149,10 @@ async def _scrape_page_core(page, url: str, proxy: str = None) -> List[Dict[str,
                 "price": price, 
                 "description": description,
                 "image_url": image_url,
-                "url": link, 
-                "postcode": None, 
+                "url": link,
+                "listing_type": "buy_it_now",  # AutoTrader is always buy-it-now
+                "vat_included": vat_included,
+                "postcode": None,  # Will be added by worker
                 "proxy": proxy
             })
         
@@ -1579,7 +1586,7 @@ def main():
             logger.info("Recording success rates for postcodes...")
             success_counts = df.groupby('postcode').size()
             for postcode, count in success_counts.items():
-                postcode_manager.record_success_rate(postcode, count)
+                postcode_manager.record_success_rate(postcode, count, "autotrader")
             
             # Show updated stats
             stats = postcode_manager.get_stats()
